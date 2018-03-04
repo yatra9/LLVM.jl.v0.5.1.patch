@@ -1,0 +1,347 @@
+diff --git a/deps/build.jl b/deps/build.jl
+index a544eda..4c2fd4c 100644
+--- a/deps/build.jl
++++ b/deps/build.jl
+@@ -1,4 +1,5 @@
+ # entry point for Pkg: performs all necessary build-time tasks, and writes ext.jl
++# applied patch for LLVM.jl v0.5.1 in order to operate with Julia v0.6.2 windows version
+ 
+ include("compile.jl")
+ 
+@@ -24,7 +25,11 @@ function main()
+     config[:libllvm_mtime]   = llvm.mtime
+     config[:libllvm_system]  = use_system_llvm
+ 
+-    llvm_targets = Symbol.(split(read(`$(get(llvm.config)) --targets-built`, String)))
++    if is_windows() && isempty(get(llvm.config))
++        llvm_targets = [:NVPTX, :X86]
++    else
++        llvm_targets = Symbol.(split(read(`$(get(llvm.config)) --targets-built`, String)))
++    end
+     config[:libllvm_targets] = llvm_targets
+ 
+     wrapper = select_wrapper(llvm, wrappers)
+@@ -32,11 +37,10 @@ function main()
+ 
+     package_commit =
+         try
+-            cd(joinpath(@__DIR__, "..")) do
+-                chomp(read(`git rev-parse HEAD`, String))
+-            end
++            repo = LibGit2.GitRepo(joinpath(@__DIR__, ".."))
++            string(LibGit2.head_oid(repo))
+         catch
+-            warning("could not get LLVM.jl commit")
++            warn("could not get LLVM.jl commit")
+             # NOTE: we don't explicitly check for commit==nothing, because
+             #       it will imply that dirty=true, making us rebuild anyway
+             nothing
+@@ -45,20 +49,20 @@ function main()
+ 
+     package_dirty =
+         try
+-            cd(joinpath(@__DIR__, "..")) do
+-                length(chomp(read(`git diff --shortstat`, String))) > 0
++            repo = LibGit2.GitRepo(joinpath(@__DIR__, ".."))
++            LibGit2.isdirty(repo) && open(@__FILE__) do f
++              !contains(readstring(f), "# applied patch for LLVM.jl v0.5.1 in order to operate with Julia v0.6.2 windows version")
+             end
+         catch
+-            warning("could not get LLVM.jl git status")
++            warn("could not get LLVM.jl git status")
+             true
+         end
+ 
+-
+     ## build extras library
+ 
+     config[:libllvm_extra_path] = extras_path
+     if !isfile(extras_path) || package_dirty
+-        compile_extras(llvm, julia)
++        compile_extras(llvm, julia, config)
+     end
+ 
+ 
+diff --git a/deps/compile.jl b/deps/compile.jl
+index 7ed3916..87bf17a 100644
+--- a/deps/compile.jl
++++ b/deps/compile.jl
+@@ -2,7 +2,7 @@
+ 
+ include("select.jl")
+ 
+-const libext = Compat.Sys.isapple() ? "dylib" : "so"
++const libext = Compat.Sys.isapple() ? "dylib" : Compat.Sys.iswindows() ? "dll" : "so"
+ 
+ # properties of the final location of llvm-extra
+ const extras_name = "LLVM_extras.$libext"
+@@ -11,16 +11,91 @@ const extras_path = joinpath(extras_dir, extras_name)
+ 
+ verbose_run(cmd) = (println(cmd); run(cmd))
+ 
+-function compile_extras(llvm, julia)
++function compile_extras(llvm, julia, config)
+     debug("Compiling extras library for LLVM $llvm and Julia $julia")
+ 
+     # properties of the in-tree build of llvm-extra
+     extras_src_dir = joinpath(@__DIR__, "llvm-extra")
+     extras_src_path = joinpath(extras_src_dir, "libLLVM_extra.$libext")
+ 
++    if Compat.Sys.iswindows()
++        if !haskey(ENV, "LLVM_JL_COMPILE") || uppercase(ENV["LLVM_JL_COMPILE"]) != "TRUE"
++            debug("Downloadinf extras library to $extras_path")
++            url = "https://github.com/yatra9/LLVM.jl.v0.5.1.patch/releases/download/v0.0.1/LLVM_extras.dll"
++            download(url, extras_path)
++            return
++        end
++        cygwindir = "C:\\cygwin64"  # default path
++        if haskey(ENV, "CYGWINROOT")
++            cygwindir = ENV["CYGWINROOT"]
++        else
++            # copied from https://github.com/simonbyrne/WinReg.jl
++            let
++                base = 0x80000002 # HKEY_LOCAL_MACHINE
++                path = "SOFTWARE\\Cygwin\\setup"
++                valuename = "rootdir"
++
++                keyref = Ref{UInt32}()
++                ret = ccall((:RegOpenKeyExW, "advapi32"), stdcall, Clong,
++                            (UInt32, Cwstring, UInt32, UInt32, Ref{UInt32}),
++                            base, path, 0, 0x20019, keyref)
++                if iszero(ret)
++                    try
++                        dwSize = Ref{UInt32}()
++                        dwDataType = Ref{UInt32}()
++                        ret = ccall((:RegQueryValueExW, "advapi32"), stdcall, Clong,
++                            (UInt32, Cwstring, Ptr{UInt32},
++                             Ref{UInt32}, Ptr{UInt8}, Ref{UInt32}),
++                            keyref[], valuename, C_NULL,
++                            dwDataType, C_NULL, dwSize)
++                        @assert iszero(ret)
++                        data = Array{UInt8}(dwSize[])
++                        ret = ccall((:RegQueryValueExW, "advapi32"), stdcall, Clong,
++                            (UInt32, Cwstring, Ptr{UInt32},
++                             Ref{UInt32}, Ptr{UInt8}, Ref{UInt32}),
++                            keyref[], "rootdir", C_NULL,
++                            dwDataType, data, dwSize)
++                        @assert iszero(ret)
++                        @assert dwDataType[] == 1 || dwDataType[] == 2
++                        data_wstr = reinterpret(Cwchar_t, data)
++                        data_wstr[end] == 0 && pop!(data_wstr)
++                        cygwindir = String(transcode(UInt8, data_wstr))
++                    finally
++                        ccall((:RegCloseKey, "advapi32"), stdcall, Clong, (UInt32,), keyref[])
++                    end
++                end
++            end
++        end
++        cygbin = joinpath(cygwindir, "bin")
++        cygpathbin = joinpath(cygbin, "cygpath.exe")
++        @assert ispath(cygpathbin) "cannot find cygwin. please set cygwin root directory to ENV[\"CYGWINROOT\"]. (e.g. ENV[\"CYGWINROOT\"] = \"C:\\\\cygwin64\""
++        cygpath = winpath -> chomp(String(read(`$cygpathbin -u $(winpath)`)))
++        envs = ["LLVM_LIBRARY" => cygpath(llvm.path),
++                "JULIA_CONFIG" => get(julia.config),
++                "JULIA_BINARY" => cygpath(julia.path),
++                "PATH" => "$(cygbin);$(ENV["PATH"])",
++                "CXX" => "$(Sys.MACHINE)-g++"]
++        if isempty(get(llvm.config))
++            append!(envs, ["CPPFLAGS" => @sprintf("-I%s -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS",
++                                                  cygpath(joinpath(JULIA_HOME, "..", "include"))),
++                           "LDFLAGS" => @sprintf("-L%s", cygpath(joinpath(JULIA_HOME, "..", "lib"))),
++                           "LDLIBS" => "-lpsapi -lshell32 -lole32 -luuid",
++                           "LLVM_CXXFLAGS" => @sprintf("-I%s -D__USING_SJLJ_EXCEPTIONS__ -D__CRT__NO_INLINE -Wall -W -Wno-unused-parameter -Wwrite-strings -Wcast-qual -Wno-missing-field-initializers -pedantic -Wno-long-long -Wno-maybe-uninitialized -Wdelete-non-virtual-dtor -Wno-comment -Werror=date-time -std=gnu++11  -O2 -DNDEBUG  -fno-exceptions -fno-rtti -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS",
++                                                       cygpath(joinpath(JULIA_HOME, "..", "include"))),
++                           "HAS_RTTI" => "NO",
++                           "LLVM_TARGETS" => join(String.(config[:libllvm_targets]), " "),
++                           "CLANG_FORMAT" => cygpath(joinpath(JULIA_HOME, "clang-format"))
++                          ])
++        else
++            push!(envs, "LLVM_CONFIG" => cygpath(get(llvm.config)))
++        end
++    else
++        envs = ("LLVM_CONFIG"  => get(llvm.config),  "LLVM_LIBRARY" => llvm.path,
++                   "JULIA_CONFIG" => get(julia.config), "JULIA_BINARY" => julia.path)
++    end
++
+     cd(extras_src_dir) do
+-        withenv("LLVM_CONFIG"  => get(llvm.config),  "LLVM_LIBRARY" => llvm.path,
+-                "JULIA_CONFIG" => get(julia.config), "JULIA_BINARY" => julia.path) do
++        withenv(envs...) do
+             try
+                 verbose_run(`make -j$(Sys.CPU_CORES+1)`)
+                 mv(extras_src_path, extras_path; remove_destination=true)
+diff --git a/deps/discover.jl b/deps/discover.jl
+index b10c301..1f96397 100644
+--- a/deps/discover.jl
++++ b/deps/discover.jl
+@@ -18,6 +18,8 @@ function llvm_libnames(version::VersionNumber)
+                 "libLLVM-$(version.major).$(version.minor).$(version.patch)svn.so",
+                 "libLLVM-$(version.major).$(version.minor).so",
+                 "libLLVM-$(version.major).$(version.minor)svn.so"]
++    elseif Compat.Sys.iswindows()
++        return ["LLVM.dll"]
+     else
+         error("Unknown OS")
+     end
+@@ -95,6 +97,9 @@ function discover_llvm(libdirs, configdirs)
+ end
+ 
+ function discover_llvm()
++    if Compat.Sys.iswindows()
++        return discover_llvm_windows()
++    end
+     # look for bundled LLVM toolchains relative to JULIA_HOME
+     bundled_llvms =
+         discover_llvm([joinpath(JULIA_HOME, "..", "lib", "julia")],
+@@ -114,6 +119,34 @@ function discover_llvm()
+     return [bundled_llvms; system_llvms]
+ end
+ 
++function discover_llvm_windows()
++    @assert v"0.6" <= VERSION < v"0.7-" "This patch is only for Julia v0.6.x"
++    libdirs = [JULIA_HOME, joinpath(JULIA_HOME, "..", "lib")]
++    configdirs = [JULIA_HOME, joinpath(JULIA_HOME, "..", "tools")]
++
++    # check for llvm-config binaries in known locations
++    config = ""
++    for dir in unique(configdirs)
++        isdir(dir) || continue
++        configs = find_llvmconfig(dir)
++        if !isempty(configs)
++            config = first(first(configs))
++            break
++        end
++    end
++
++    # look for bundled LLVM toolchains relative to JULIA_HOME
++    llvms = Vector{Toolchain}()
++    for libdir in unique(libdirs)
++        libraries = find_libllvm(libdir, [base_llvm_version])
++        for (library, version) in libraries
++            push!(llvms, Toolchain(library, version, config))
++            llvms[end].props[:bundled] = true
++        end
++    end
++    return llvms
++end
++
+ 
+ #
+ # Julia discovery
+diff --git a/deps/llvm-extra/Makefile b/deps/llvm-extra/Makefile
+index 23751d3..c4cf4c9 100644
+--- a/deps/llvm-extra/Makefile
++++ b/deps/llvm-extra/Makefile
+@@ -8,11 +8,11 @@ UNAME = $(shell uname -s)
+ # LLVM flags
+ #
+ 
+-CPPFLAGS = $(shell $(LLVM_CONFIG) --cppflags)
+-LDFLAGS = $(shell $(LLVM_CONFIG) --ldflags)
+-LDLIBS = $(shell $(LLVM_CONFIG) --system-libs)
++CPPFLAGS ?= $(shell $(LLVM_CONFIG) --cppflags)
++LDFLAGS ?= $(shell $(LLVM_CONFIG) --ldflags)
++LDLIBS ?= $(shell $(LLVM_CONFIG) --system-libs)
+ 
+-LLVM_CXXFLAGS = $(shell $(LLVM_CONFIG) --cxxflags)
++LLVM_CXXFLAGS ?= $(shell $(LLVM_CONFIG) --cxxflags)
+ # filter out Clang/GCC specific options
+ BAD_LLVM_CXXFLAGS = -Wcovered-switch-default -fcolor-diagnostics -Wdelete-non-virtual-dtor -gline-tables-only -Wstring-conversion
+ CXXFLAGS = $(filter-out $(BAD_LLVM_CXXFLAGS),$(LLVM_CXXFLAGS))
+@@ -40,19 +40,24 @@ ifeq ($(UNAME), Darwin)
+   # NOTE: we wouldn't need the above hack, or the rpath additions,
+   #       if libLLVM/libLTO had a proper `install_path` set-up
+ else
+-  # specify the versioned library name to make sure we pick up the correct one
+-  LDLIBS += -l:$(notdir $(LLVM_LIBRARY))
++  ifeq ($(findstring CYGWIN, $(UNAME)), CYGWIN)
++    #LDLIBS += "$(LLVM_LIBRARY)" "$(dir $(LLVM_LIBRARY))libjulia.dll.a" 
++    LDLIBS += -l:LLVM.dll -l:libjulia.dll
++  else
++    # specify the versioned library name to make sure we pick up the correct one
++    LDLIBS += -l:$(notdir $(LLVM_LIBRARY))
++  endif
+ endif
+ 
+ # handle RTTI flags
+-HAS_RTTI=$(shell $(LLVM_CONFIG) --has-rtti)
++HAS_RTTI ?= $(shell $(LLVM_CONFIG) --has-rtti)
+ ifneq ($(HAS_RTTI),"YES")
+ CXXFLAGS += -fno-rtti
+ endif
+ 
+ # we shouldn't use target-specific symbols unless the target is built,
+ # so generate preprocessor definitions
+-LLVM_TARGETS = $(shell $(LLVM_CONFIG) --targets-built | tr '[:lower:]' '[:upper:]')
++LLVM_TARGETS ?= $(shell $(LLVM_CONFIG) --targets-built | tr '[:lower:]' '[:upper:]')
+ CPPFLAGS += $(addprefix -DTARGET_, $(LLVM_TARGETS))
+ 
+ # try to detect LLVM's C++ ABI, and configure GLIBC accordingly
+@@ -65,6 +70,9 @@ ifdef NM
+   ifeq ($(UNAME),Darwin)
+     CXX11_SYMBOLS=$(shell $(NM) -g "$(LLVM_LIBRARY)" | grep -E "(_cxx11|B5cxx11)")
+   endif
++  ifeq ($(findstring CYGWIN, $(UNAME)), CYGWIN)
++    CXX11_SYMBOLS=$(shell objdump -t "$(dir $(JULIA_BINARY))LLVM.dll" | grep -E "(_cxx11|B5cxx11)")
++  endif
+   ifeq ($(CXX11_SYMBOLS),)
+     CPPFLAGS += -D_GLIBCXX_USE_CXX11_ABI=0
+   else
+@@ -106,7 +114,11 @@ CXXFLAGS += $(EXTRA_CXXFLAGS)
+ ifeq ($(UNAME), Darwin)
+   SLIB := dylib
+ else
+-  SLIB := so
++  ifeq ($(findstring CYGWIN, $(UNAME)), CYGWIN)
++    SLIB := dll
++  else
++    SLIB := so
++  endif
+ endif
+ 
+ TARGET  = libLLVM_extra.$(SLIB)
+diff --git a/src/LLVM.jl b/src/LLVM.jl
+index 3231a35..29067dd 100644
+--- a/src/LLVM.jl
++++ b/src/LLVM.jl
+@@ -87,6 +87,7 @@ function __init__()
+ 
+     if !libllvm_system
+         libllvm[] = Libdl.dlopen(libllvm_extra_path)
++        is_windows() && (libllvm0[] = Libdl.dlopen(joinpath(JULIA_HOME, "LLVM.dll")))
+     elseif is_linux()
+         libllvm[] = dlmopen(LM_ID_NEWLM, libllvm_extra_path)
+     else
+diff --git a/src/base.jl b/src/base.jl
+index 6e3bb40..b001bad 100644
+--- a/src/base.jl
++++ b/src/base.jl
+@@ -6,6 +6,7 @@
+ #
+ 
+ const libllvm = Ref{Ptr{Void}}()
++const libllvm0 = Ref{Ptr{Void}}()
+ 
+ macro apicall(fun, rettyp, argtypes, args...)
+     if VERSION >= v"0.7.0-DEV.1729"
+@@ -18,8 +19,17 @@ macro apicall(fun, rettyp, argtypes, args...)
+ 
+     configured || return :(error("LLVM.jl has not been configured."))
+ 
+-    return quote
+-        ccall(Libdl.dlsym(libllvm[], $fun), $(esc(rettyp)),
+-              $(esc(argtypes)), $(map(esc, args)...))
++    if is_windows()
++        return quote
++            local entry = Libdl.dlsym_e(libllvm0[], $fun)
++            ccall(entry != C_NULL ? entry : Libdl.dlsym(libllvm[], $fun),
++                  $(esc(rettyp)),
++                  $(esc(argtypes)), $(map(esc, args)...))
++        end
++    else
++        return quote
++            ccall(Libdl.dlsym(libllvm[], $fun), $(esc(rettyp)),
++                  $(esc(argtypes)), $(map(esc, args)...))
++        end
+     end
+ end
